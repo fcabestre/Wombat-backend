@@ -1,73 +1,38 @@
-use warp::filters::ws::WebSocket;
-use warp::ws::Message;
-use warp::{Filter, Future, Stream};
+#[macro_use]
+extern crate log;
 
-use futures::sync::mpsc;
-use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
-use wombat::hguid::HGuid;
+use warp::ws::Message;
+use warp::{Filter, Future, Reply, Stream};
+
+use warp::filters::BoxedFilter;
+use wombat::connections::Connections;
 use wombat::stats_stream::stats_stream;
 
 fn main() {
-    let connections = Connections::new();
-    let connections = warp::any().map(move || connections.clone());
     pretty_env_logger::init();
-    let routes = warp::path("stats").and(warp::ws2()).and(connections).map(
-        |ws: warp::ws::Ws2, connections: Connections| {
-            let connections2 = connections.clone();
-            warp::spawn(stats_stream().map_err(|_| ()).for_each(move |stats| {
-                connections2.fan_out(Message::text(serde_json::to_string(&stats).unwrap()));
-                Ok(())
-            }));
+
+    let connections = Connections::new();
+    let connections2 = connections.clone();
+    let (addr, warp_server) =
+        warp::serve(route_definition(connections)).bind_ephemeral(([0, 0, 0, 0], 3030));
+    trace!("listening on {:?}", addr);
+    tokio::run(warp_server.join(stats_producer(connections2)).map(|_| ()))
+}
+
+fn route_definition(connections: Connections) -> BoxedFilter<(impl Reply,)> {
+    let with_connections = warp::any().map(move || connections.clone());
+    warp::path("stats")
+        .and(warp::ws2())
+        .and(with_connections)
+        .map(|ws: warp::ws::Ws2, connections: Connections| {
             ws.on_upgrade(move |websocket| connections.add(websocket))
-        },
-    );
-    warp::serve(routes).run(([0, 0, 0, 0], 3030));
+        })
+        .boxed()
 }
 
-#[derive(Clone)]
-struct Connections {
-    out_channels: Arc<Mutex<HashMap<HGuid, mpsc::UnboundedSender<Message>>>>,
-}
-
-impl Connections {
-    fn new() -> Connections {
-        Connections {
-            out_channels: Arc::new(Mutex::new(HashMap::new())),
-        }
-    }
-
-    fn fan_out(&self, message: Message) {
-        for (_, out_channel) in self.out_channels.lock().unwrap().iter() {
-            out_channel.unbounded_send(message.clone()).unwrap();
-        }
-    }
-
-    fn add(&self, websocket: WebSocket) -> impl Future<Item = (), Error = ()> {
-        let channel_id = HGuid::new();
-        let (tx, rx) = mpsc::unbounded();
-        let (ws_tx, ws_rx) = websocket.split();
-
-        warp::spawn(
-            rx.map_err(|()| -> warp::Error { unreachable!("unbounded rx never errors") })
-                .forward(ws_tx)
-                .map(|_tx_rx| ())
-                .map_err(|ws_err| eprintln!("websocket send error: {}", ws_err)),
-        );
-
-        println!("adding connection uid={:?}", channel_id);
-        self.out_channels.lock().unwrap().insert(channel_id, tx);
-
-        let out_channels2 = self.out_channels.clone();
-        ws_rx
-            .for_each(move |_| Ok(()))
-            .then(move |result| {
-                println!("removing connection uid={:?}", channel_id);
-                out_channels2.lock().unwrap().remove(&channel_id);
-                result
-            })
-            .map_err(move |e| {
-                eprintln!("websocket error(uid={:?}): {}", channel_id, e);
-            })
-    }
+fn stats_producer(connections: Connections) -> impl Future<Item = (), Error = ()> {
+    stats_stream().map_err(|_| ()).for_each(move |stats| {
+        connections.dispatch_message(Message::text(serde_json::to_string(&stats).unwrap()));
+        Ok(())
+    })
 }

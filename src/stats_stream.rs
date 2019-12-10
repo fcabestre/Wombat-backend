@@ -10,6 +10,7 @@ use tokio_timer::throttle::{Throttle, ThrottleError};
 use crate::stats::Stats;
 
 fn read_stats() -> Poll<Option<Stats>, tokio::io::Error> {
+    trace!("polling file /proc/stats");
     let data = try_ready!(tokio::fs::read("/proc/stat").poll());
     let file_content = str::from_utf8(data.as_slice()).unwrap();
     let stats = Stats::parse(file_content);
